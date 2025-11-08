@@ -78,14 +78,14 @@ pub fn run_popup_ui() {
         timeout_add_local(Duration::from_secs(4), update_ui);
 
         // Auto-close on focus loss (GTK4 controllers, no Inhibit)
-        let focus = EventControllerFocus::new();
-        {
-            let popup = popup.clone();
-            focus.connect_leave(move |_| {
-                popup.close();
-            });
-        }
-        popup.add_controller(focus);
+        // let focus = EventControllerFocus::new();
+        // {
+        //     let popup = popup.clone();
+        //     focus.connect_leave(move |_| {
+        //         popup.close();
+        //     });
+        // }
+        // popup.add_controller(focus);
 
         // Close on Esc key
         let key = EventControllerKey::new();
@@ -228,14 +228,21 @@ fn build_column(
     let v = GtkBox::new(Orientation::Vertical, 6);
     let app_name = s.name.to_lowercase();
 
+    // Icon widget
     let icon_widget = if let Some(path_or_name) = icons.get(&app_name) {
         if std::path::Path::new(path_or_name.as_str()).exists() {
-            // File path → load and scale (GTK4 Pixbuf from gtk4::gdk_pixbuf)
+            // File path → load and scale
             match Pixbuf::from_file_at_size(path_or_name, 48, 48) {
-                Ok(pixbuf) => Image::from_pixbuf(Some(&pixbuf)),
+                Ok(pixbuf) => {
+                    let img = Image::from_pixbuf(Some(&pixbuf));
+                    img.set_pixel_size(48);
+                    img.set_size_request(48, 48);
+                    img
+                }
                 Err(_) => {
                     let img = Image::from_icon_name("applications-multimedia");
                     img.set_pixel_size(48);
+                    img.set_size_request(48, 48);
                     img
                 }
             }
@@ -243,11 +250,13 @@ fn build_column(
             // Theme icon name
             let img = Image::from_icon_name(path_or_name);
             img.set_pixel_size(48);
+            img.set_size_request(48, 48);
             img
         }
     } else {
         let img = Image::from_icon_name("applications-multimedia");
         img.set_pixel_size(48);
+        img.set_size_request(48, 48);
         img
     };
 
@@ -264,7 +273,7 @@ fn build_column(
     let mute = ToggleButton::with_label("Mute");
     mute.set_active(s.mute);
 
-    // Slider
+    // Slider binding
     let id = s.id;
     let backend1: Arc<Mutex<PulseAudioCli>> = Arc::clone(backend);
     scale.connect_value_changed(move |sc| {
@@ -275,7 +284,7 @@ fn build_column(
         }
     });
 
-    // Mute toggle
+    // Mute binding
     let id2 = s.id;
     let backend2: Arc<Mutex<PulseAudioCli>> = Arc::clone(backend);
     mute.connect_toggled(move |btn| {
@@ -286,7 +295,7 @@ fn build_column(
         }
     });
 
-    // Append (GTK4), not pack_start
+    // Append children (GTK4)
     v.append(&icon_widget);
     v.append(&label);
     v.append(&scale);
@@ -294,6 +303,7 @@ fn build_column(
 
     v
 }
+
 
 // Optional: theme fallback mapping helper
 fn icon_for_app(name: &str) -> &str {
