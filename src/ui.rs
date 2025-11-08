@@ -1,20 +1,20 @@
 use std::collections::HashMap;
 use std::fs;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use shellexpand;
 
 use ini::Ini;
 
-use gtk4::glib::{ControlFlow, timeout_add_local};
 use gtk4::gdk::Key;
+use gtk4::gdk_pixbuf::Pixbuf;
+use gtk4::glib::{timeout_add_local, ControlFlow};
 use gtk4::prelude::*;
 use gtk4::{
-    Application, ApplicationWindow, Box as GtkBox, Image, Label, Orientation, Scale, Separator, ToggleButton, Window,
-    EventControllerFocus, EventControllerKey,
+    Application, ApplicationWindow, Box as GtkBox, EventControllerFocus, EventControllerKey, Image,
+    Label, Orientation, Scale, Separator, ToggleButton, Window,
 };
-use gtk4::gdk_pixbuf::Pixbuf;
 
 use crate::audio::{AudioBackend, Stream};
 use crate::pulseaudio_cli::PulseAudioCli;
@@ -78,14 +78,30 @@ pub fn run_popup_ui() {
         timeout_add_local(Duration::from_secs(4), update_ui);
 
         // Auto-close on focus loss (GTK4 controllers, no Inhibit)
-        // let focus = EventControllerFocus::new();
-        // {
-        //     let popup = popup.clone();
-        //     focus.connect_leave(move |_| {
-        //         popup.close();
-        //     });
-        // }
-        // popup.add_controller(focus);
+        #[cfg(not(debug_assertions))]
+        {
+            let focus = EventControllerFocus::new();
+            let opened_at = Instant::now();
+            let popup_clone = popup.clone();
+
+            focus.connect_leave(move |_| {
+                let min_open = Duration::from_millis(2000); // adjust as needed
+                let elapsed = opened_at.elapsed();
+
+                if elapsed >= min_open {
+                    popup_clone.close();
+                } else {
+                    // Schedule closure once the minimum time has passed
+                    let remaining = min_open - elapsed;
+                    let popup_delayed = popup_clone.clone();
+                    glib::timeout_add_local_once(remaining, move || {
+                        popup_delayed.close();
+                    });
+                }
+            });
+
+            popup.add_controller(focus);
+        }
 
         // Close on Esc key
         let key = EventControllerKey::new();
@@ -304,7 +320,6 @@ fn build_column(
     v
 }
 
-
 // Optional: theme fallback mapping helper
 fn icon_for_app(name: &str) -> &str {
     match name.to_lowercase().as_str() {
@@ -333,7 +348,9 @@ fn load_desktop_icons() -> HashMap<String, String> {
                     let path = entry.path();
                     if let Ok(conf) = Ini::load_from_file(&path) {
                         if let Some(section) = conf.section(Some("Desktop Entry")) {
-                            if let (Some(name), Some(icon)) = (section.get("Name"), section.get("Icon")) {
+                            if let (Some(name), Some(icon)) =
+                                (section.get("Name"), section.get("Icon"))
+                            {
                                 println!("Loaded desktop entry: {} -> {}", name, icon);
                                 map.insert(name.to_lowercase(), icon.to_string());
                             }
@@ -384,4 +401,3 @@ fn load_flatpak_icons() -> HashMap<String, String> {
     }
     map
 }
-
