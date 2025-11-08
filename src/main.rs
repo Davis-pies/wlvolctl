@@ -1,3 +1,11 @@
+// src/main.rs
+
+mod audio;
+mod pulseaudio_cli;
+mod ui;
+
 fn main() {
-    println!("Hello, world!");
+    ui::run_ui();
 }
+
+

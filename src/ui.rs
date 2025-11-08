@@ -1,0 +1,280 @@
+use crate::audio::AudioBackend;
+use crate::pulseaudio_cli::PulseAudioCli;
+use gdk_pixbuf::Pixbuf;
+use gtk::prelude::*;
+use gtk::{
+    Application, ApplicationWindow, Box as GtkBox, Image, Label, Orientation, Scale, Separator,
+    ToggleButton,
+};
+use ini::Ini; // from rust-ini crate
+use shellexpand;
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+pub fn run_ui() {
+    let app = Application::new(Some("org.wlvolctl.ui"), Default::default());
+    app.connect_activate(|app| {
+        let backend = Arc::new(Mutex::new(PulseAudioCli));
+        let icon_cache = Arc::new(load_icon_cache());
+
+        let window = ApplicationWindow::new(app);
+        window.set_title("wlvolctl POC");
+        window.set_default_size(600, 300);
+
+        let vbox = GtkBox::new(Orientation::Vertical, 6);
+        window.add(&vbox);
+
+        let header = Label::new(Some("Per-application volumes"));
+        vbox.pack_start(&header, false, false, 0);
+        vbox.pack_start(&Separator::new(Orientation::Horizontal), false, false, 0);
+
+        // Horizontal container for stream columns
+        let streams_box = GtkBox::new(Orientation::Horizontal, 12);
+        vbox.pack_start(&streams_box, true, true, 0);
+
+        // Refresh loop
+        let streams_box_clone = streams_box.clone();
+        let backend_clone = Arc::clone(&backend);
+        let icons_clone = Arc::clone(&icon_cache);
+
+        let update_ui = move || {
+            let streams = backend_clone
+                .lock()
+                .unwrap()
+                .list_streams()
+                .unwrap_or_default();
+
+            // Clear existing children
+            for child in streams_box_clone.children() {
+                streams_box_clone.remove(&child);
+            }
+
+            if streams.is_empty() {
+                let empty = Label::new(Some("No active streams"));
+                streams_box_clone.pack_start(&empty, false, false, 0);
+            } else {
+                for s in streams {
+                    let col = build_column(&backend_clone, &icons_clone, s);
+                    streams_box_clone.pack_start(&col, false, false, 0);
+                }
+            }
+
+            streams_box_clone.show_all();
+            glib::ControlFlow::Continue
+        };
+
+        update_ui();
+        glib::timeout_add_local(Duration::from_secs(2), update_ui);
+
+        window.show_all();
+    });
+
+    app.run();
+}
+fn load_icon_cache() -> HashMap<String, String> {
+    let mut map = HashMap::new();
+
+    // Desktop files
+    let desktop_dirs = vec!["/usr/share/applications", "~/.local/share/applications"];
+    for dir in desktop_dirs {
+        let expanded = shellexpand::tilde(dir).to_string();
+        if let Ok(entries) = std::fs::read_dir(&expanded) {
+            for entry in entries.flatten() {
+                if entry.path().extension().and_then(|s| s.to_str()) == Some("desktop") {
+                    if let Ok(conf) = ini::Ini::load_from_file(entry.path()) {
+                        if let Some(section) = conf.section(Some("Desktop Entry")) {
+                            if let (Some(name), Some(icon)) =
+                                (section.get("Name"), section.get("Icon"))
+                            {
+                                map.insert(name.to_lowercase(), icon.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Flatpak scalable SVGs
+    let flatpak_dirs = vec![
+        "~/.local/share/flatpak/exports/share/icons/hicolor/scalable/apps",
+        "/var/lib/flatpak/exports/share/icons/hicolor/scalable/apps",
+    ];
+    for dir in flatpak_dirs {
+        let expanded = shellexpand::tilde(dir).to_string();
+        if let Ok(entries) = std::fs::read_dir(&expanded) {
+            for entry in entries.flatten() {
+                if let Some(fname) = entry.file_name().to_str() {
+                    if fname.ends_with(".svg") {
+                        let app_id = fname.trim_end_matches(".svg");
+                        let path = entry.path().to_string_lossy().to_string();
+                        map.insert(app_id.to_lowercase(), path.clone());
+                        if let Some(stripped) = app_id.split('.').last() {
+                            map.insert(stripped.to_lowercase(), path.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    println!("Icon cache loaded: {} entries", map.len());
+    map
+}
+
+fn build_column(
+    backend: &Arc<Mutex<PulseAudioCli>>,
+    icons: &Arc<HashMap<String, String>>,
+    s: crate::audio::Stream,
+) -> GtkBox {
+    let v = GtkBox::new(Orientation::Vertical, 6);
+    let app_name = s.name.to_lowercase();
+
+    let icon_widget = if let Some(path_or_name) = icons.get(&app_name) {
+        if std::path::Path::new(path_or_name).exists() {
+            // File path → load and scale
+            if let Ok(pixbuf) = Pixbuf::from_file_at_size(path_or_name, 48, 48) {
+                Image::from_pixbuf(Some(&pixbuf))
+            } else {
+                Image::from_icon_name(Some("applications-multimedia"), gtk::IconSize::Dialog)
+            }
+        } else {
+            // Theme icon name
+            let img = Image::from_icon_name(Some(path_or_name.as_str()), gtk::IconSize::Dialog);
+            img.set_pixel_size(48);
+            img
+        }
+    } else {
+        let img = Image::from_icon_name(Some("applications-multimedia"), gtk::IconSize::Dialog);
+        img.set_pixel_size(48);
+        img
+    };
+
+    // Label, slider, mute toggle (unchanged)
+    let label = Label::new(Some(&s.name));
+    label.set_xalign(0.5);
+
+    let scale = Scale::with_range(Orientation::Vertical, 0.0, 1.0, 0.01);
+    scale.set_inverted(true);
+    scale.set_draw_value(false);
+    scale.set_size_request(60, 160);
+    scale.set_value(s.volume_01 as f64);
+
+    let mute = ToggleButton::with_label("Mute");
+    mute.set_active(s.mute);
+
+    // Bind events...
+    // Slider
+    let id = s.id;
+    let backend1 = Arc::clone(backend);
+    scale.connect_value_changed(move |sc| {
+        let val = sc.value() as f32;
+        if let Ok(b) = backend1.lock() {
+            let _ = b.set_volume(id, val);
+            println!("Set volume for {} to {}", id, val);
+        }
+    });
+
+    // Mute toggle
+    let id2 = s.id;
+    let backend2 = Arc::clone(backend);
+    mute.connect_toggled(move |btn| {
+        let active = btn.is_active();
+        if let Ok(b) = backend2.lock() {
+            let _ = b.set_mute(id2, active);
+            println!("Mute for {} set to {}", id2, active);
+        }
+    });
+
+    // (same as before)
+
+    v.pack_start(&icon_widget, false, false, 0);
+    v.pack_start(&label, false, false, 0);
+    v.pack_start(&scale, true, true, 0);
+    v.pack_start(&mute, false, false, 0);
+
+    v
+}
+
+fn icon_for_app(name: &str) -> &str {
+    match name.to_lowercase().as_str() {
+        "firefox" => "firefox",
+        "vlc" => "vlc",
+        "spotify" => "spotify",
+        "stremio" => "video-player", // fallback if no specific icon
+        _ => "applications-multimedia",
+    }
+}
+
+fn load_desktop_icons() -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let dirs = vec![
+        "/usr/share/applications",
+        "~/.local/share/applications",
+        "~/.local/share/flatpak/exports/share/applications",
+    ];
+
+    for dir in dirs {
+        let expanded = shellexpand::tilde(dir).to_string();
+        if let Ok(entries) = fs::read_dir(&expanded) {
+            println!("Scanning directory: {}", expanded);
+            for entry in entries.flatten() {
+                if entry.path().extension().and_then(|s| s.to_str()) == Some("desktop") {
+                    let path = entry.path();
+                    if let Ok(conf) = Ini::load_from_file(&path) {
+                        if let Some(section) = conf.section(Some("Desktop Entry")) {
+                            if let (Some(name), Some(icon)) =
+                                (section.get("Name"), section.get("Icon"))
+                            {
+                                println!("Loaded desktop entry: {} -> {}", name, icon);
+                                map.insert(name.to_lowercase(), icon.to_string());
+                            }
+                        }
+                    } else {
+                        println!("Failed to parse: {:?}", path);
+                    }
+                }
+            }
+        } else {
+            println!("Directory not found: {}", expanded);
+        }
+    }
+
+    println!("Total icons loaded: {}", map.len());
+    map
+}
+fn load_flatpak_icons() -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let dirs = vec![
+        "~/.local/share/flatpak/exports/share/icons/hicolor/128x128/apps",
+        "/var/lib/flatpak/exports/share/icons/hicolor/128x128/apps",
+    ];
+
+    for dir in dirs {
+        let expanded = shellexpand::tilde(dir).to_string();
+        if let Ok(entries) = std::fs::read_dir(expanded) {
+            for entry in entries.flatten() {
+                if let Some(fname) = entry.file_name().to_str() {
+                    if fname.ends_with(".png") {
+                        let app_id = fname.trim_end_matches(".png");
+                        // store both full ID and stripped name
+                        map.insert(
+                            app_id.to_lowercase(),
+                            entry.path().to_string_lossy().to_string(),
+                        );
+                        if let Some(stripped) = app_id.split('.').last() {
+                            map.insert(
+                                stripped.to_lowercase(),
+                                entry.path().to_string_lossy().to_string(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    map
+}
