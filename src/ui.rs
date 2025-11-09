@@ -1,41 +1,64 @@
+// src/ui.rs
 use std::collections::HashMap;
 use std::fs;
+use std::cell::Cell;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use shellexpand;
 
 use ini::Ini;
 
-use gtk4::gdk::Key;
+use gtk4::gdk::Key; 
 use gtk4::gdk_pixbuf::Pixbuf;
-use gtk4::glib::{timeout_add_local, ControlFlow};
-use gtk4::prelude::*;
+use gtk4::prelude::*; // This pulls in most required traits like WidgetExt
 use gtk4::{
-    Application, ApplicationWindow, Box as GtkBox, EventControllerFocus, EventControllerKey, Image,
-    Label, Orientation, Scale, Separator, ToggleButton, Window,
+    Application, ApplicationWindow, Box as GtkBox, EventControllerKey, Image,
+    Label, Orientation, Scale, Separator, ToggleButton,
 };
+use gtk4_layer_shell::{Edge, Layer, LayerShell};
 
 use crate::audio::{AudioBackend, Stream};
 use crate::pulseaudio_cli::PulseAudioCli;
 
-pub fn run_popup_ui() {
-    // Strip --popup so GTK doesn't see unknown args
+
+pub fn run_popup_ui(
+    module_x: Option<i32>,
+    module_y: Option<i32>,
+    module_w: Option<i32>,
+    module_h: Option<i32>,
+) {
+    println!("[DEBUG_UI]: 1. Entered run_popup_ui");
+
     let mut gtk_args: Vec<String> = std::env::args().collect();
-    gtk_args.retain(|a| a != "--popup");
+    // Retain logic to strip all custom args (x, y, w, h)
+    gtk_args.retain(|a| {
+        !a.starts_with("--popup")
+            && !a.starts_with("--x=")
+            && !a.starts_with("--y=")
+            && !a.starts_with("--w=")
+            && !a.starts_with("--h=")
+    });
 
-    let app = Application::new(Some("com.example.wlvolctl.popup"), Default::default());
+    let app = Application::new(Some("com.example.wlvolctl.popup.v2"), Default::default());
+    println!("[DEBUG_UI]: 2. Created GTK Application");
 
-    app.connect_activate(|app| {
-        // Invisible transient parent to allow proper modality/focus
-        let parent = ApplicationWindow::new(app);
-        parent.hide();
+    app.connect_activate(move |app| {
+        println!(
+            "[DEBUG_UI]: 4. [connect_activate]: Fired! module_x={:?}, module_y={:?}",
+            module_x, module_y
+        );
 
-        let popup = Window::builder()
-            .transient_for(&parent)
-            .decorated(false)
-            .resizable(false)
-            .build();
+        let popup = ApplicationWindow::new(app);
+
+        // Initialize layer shell
+        popup.init_layer_shell();
+
+        // Set as overlay layer (appears above normal windows)
+        popup.set_layer(Layer::Overlay);
+
+        // Remove window decorations
+        popup.set_decorated(false);
 
         let backend: Arc<Mutex<PulseAudioCli>> = Arc::new(Mutex::new(PulseAudioCli));
         let icon_cache = Arc::new(load_icon_cache());
@@ -43,10 +66,148 @@ pub fn run_popup_ui() {
         let hbox = GtkBox::new(Orientation::Horizontal, 12);
         popup.set_child(Some(&hbox));
 
+        // --- POSITIONING LOGIC ---
+
+        // ================== THE ANCHOR FIX ==================
+        // We MUST anchor to the top and left. This tells layer-shell
+        // to use the margins as x/y coordinates from the top-left.
+        popup.set_anchor(Edge::Left, true);
+        popup.set_anchor(Edge::Top, true);
+        popup.set_anchor(Edge::Right, false);
+        popup.set_anchor(Edge::Bottom, false);
+        // ================== END OF ANCHOR FIX ==================
+
+        // This flag ensures we only position the window ONCE
+        let is_positioned = Arc::new(Cell::new(false));
+
+        // Position the window
+        if let (Some(x), Some(y), Some(w), Some(h)) = (module_x, module_y, module_w, module_h) {
+            println!(
+                "[DEBUG_UI]: Position: Using provided coordinates (x={}, y={}, w={}, h={})",
+                x, y, w, h
+            );
+
+            // ================== Map + Defer 50ms ==================
+            popup.connect_map(move |popup_widget| {
+                println!("[DEBUG_UI]: 'map' signal Fired!");
+
+                // Only run this logic *once*
+                if is_positioned.get() {
+                    println!("[DEBUG_UI]: 'map': Already positioned, skipping.");
+                    return;
+                }
+
+                // We need to move our values into the timeout closure
+                let popup_clone = popup_widget.clone().downcast::<ApplicationWindow>().unwrap();
+                let is_positioned_clone = is_positioned.clone();
+
+                // DEFER the logic with a 50ms delay
+                gtk4::glib::timeout_add_local_once(Duration::from_millis(50), move || {
+                    let width = popup_clone.allocated_width();
+                    let height = popup_clone.allocated_height();
+                    println!("[DEBUG_UI]: 'timeout_add_local_once': Fired! w={}, h={}", width, height);
+
+                    if !is_positioned_clone.get() && height > 1 {
+                        println!("[DEBUG_UI]: 'timeout': Running position logic...");
+                        if let Some(surface) = popup_clone.surface() {
+                            let display = surface.display();
+                            
+                            // ================== MONITOR FIX ==================
+                            // Manually find the monitor at point (x, y)
+                            let monitors = display.monitors();
+                            
+                            // FIX: Use gtk4::gdk::Monitor
+                            let mut target_monitor: Option<gtk4::gdk::Monitor> = None;
+                            
+                            for i in 0..monitors.n_items() {
+                                if let Some(obj) = monitors.item(i) {
+                                    // FIX: Use gtk4::gdk::Monitor
+                                    if let Ok(monitor) = obj.downcast::<gtk4::gdk::Monitor>() {
+                                        let geom = monitor.geometry();
+                                        // Check if (x, y) is inside this monitor's geometry
+                                        if x >= geom.x() && x < (geom.x() + geom.width()) &&
+                                           y >= geom.y() && y < (geom.y() + geom.height()) {
+                                            target_monitor = Some(monitor);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            if let Some(monitor) = target_monitor {
+                            // ================== END MONITOR FIX ==================
+                                let monitor_geom = monitor.geometry();
+                                let monitor_center_y =
+                                    monitor_geom.y() + (monitor_geom.height() / 2);
+
+                                // Inference: Determine if the bar is on top or bottom
+                                let final_y = if y < monitor_center_y {
+                                    // Bar is on TOP, position window BELOW module
+                                    y + h
+                                } else {
+                                    // Bar is on BOTTOM, position window ABOVE module
+                                    y - height
+                                };
+
+                                // Center the popup horizontally over the module
+                                let mut final_x = x + (w / 2) - (width / 2);
+
+                                // Clamp X to stay on-screen (relative to THIS monitor)
+                                let monitor_x_start = monitor_geom.x();
+                                let monitor_x_end = monitor_geom.x() + monitor_geom.width();
+                                let max_x = monitor_x_end - width;
+
+                                // Clamp ensures final_x is within [monitor_x_start, max_x]
+                                final_x =
+                                    final_x.clamp(monitor_x_start, max_x.max(monitor_x_start));
+
+                                println!(
+                                    "[DEBUG_UI]: 'timeout': Calculated final_x={}, final_y={}",
+                                    final_x, final_y
+                                );
+
+                                // Because we anchored Left/Top, these margins are now
+                                // (x, y) coordinates relative to the top-left corner.
+                                popup_clone.set_margin(Edge::Left, final_x);
+                                popup_clone.set_margin(Edge::Top, final_y);
+
+                                is_positioned_clone.set(true); // Mark as positioned
+                                println!("[DEBUG_UI]: 'timeout': Position set!");
+                            } else {
+                                println!("[DEBUG_UI]: 'timeout': FAILED to find monitor at (x,y) = ({}, {})", x, y);
+                            }
+                        } else {
+                            println!("[DEBUG_UI]: 'timeout': FAILED to get surface");
+                        }
+                    } else {
+                        if !is_positioned_clone.get() {
+                            println!("[DEBUG_UI]: 'timeout': height was 0 or 1, not positioning.");
+                        }
+                    }
+                });
+            });
+
+        } else {
+            println!("[DEBUG_UI]: Position: Using fallback (top-right). Coords were None.");
+
+            // Fallback if coordinates are missing: top-right corner
+            // We must set the *correct* anchors for this to work
+            popup.set_anchor(Edge::Right, true);
+            popup.set_anchor(Edge::Top, true);
+            popup.set_anchor(Edge::Left, false); // Make sure this is false
+            popup.set_anchor(Edge::Bottom, false); // Make sure this is false
+
+            popup.set_margin(Edge::Right, 10);
+            popup.set_margin(Edge::Top, 40);
+        }
+
+        // Don't steal keyboard focus
+        popup.set_keyboard_mode(gtk4_layer_shell::KeyboardMode::None);
+
         // Refresh closure
         let hbox_clone = hbox.clone();
         let backend_clone = Arc::clone(&backend);
-        let icons_clone = Arc::clone(&icon_cache);
+        let icons_clone = Arc::new(load_icon_cache());
 
         let update_ui = move || {
             let streams: Vec<Stream> = {
@@ -70,38 +231,12 @@ pub fn run_popup_ui() {
             }
 
             hbox_clone.show();
-            ControlFlow::Continue
+            gtk4::glib::ControlFlow::Continue
         };
 
         // Run once immediately, then every 4 seconds
         update_ui();
-        timeout_add_local(Duration::from_secs(4), update_ui);
-
-        // Auto-close on focus loss (GTK4 controllers, no Inhibit)
-        #[cfg(not(debug_assertions))]
-        {
-            let focus = EventControllerFocus::new();
-            let opened_at = Instant::now();
-            let popup_clone = popup.clone();
-
-            focus.connect_leave(move |_| {
-                let min_open = Duration::from_millis(2000); // adjust as needed
-                let elapsed = opened_at.elapsed();
-
-                if elapsed >= min_open {
-                    popup_clone.close();
-                } else {
-                    // Schedule closure once the minimum time has passed
-                    let remaining = min_open - elapsed;
-                    let popup_delayed = popup_clone.clone();
-                    glib::timeout_add_local_once(remaining, move || {
-                        popup_delayed.close();
-                    });
-                }
-            });
-
-            popup.add_controller(focus);
-        }
+        gtk4::glib::timeout_add_local(Duration::from_secs(4), update_ui);
 
         // Close on Esc key
         let key = EventControllerKey::new();
@@ -121,7 +256,9 @@ pub fn run_popup_ui() {
         popup.present();
     });
 
+    println!("[DEBUG_UI]: 3. Calling app.run_with_args()...");
     app.run_with_args(&gtk_args);
+    println!("[DEBUG_UI]: 5. app.run_with_args() has exited.");
 }
 
 pub fn run_full_ui() {
@@ -173,11 +310,11 @@ pub fn run_full_ui() {
             }
 
             streams_box_clone.show();
-            ControlFlow::Continue
+            gtk4::glib::ControlFlow::Continue // <-- FIX 3
         };
 
         update_ui();
-        timeout_add_local(Duration::from_secs(4), update_ui);
+        gtk4::glib::timeout_add_local(Duration::from_secs(4), update_ui); // <-- FIX 4
 
         window.show();
     });
